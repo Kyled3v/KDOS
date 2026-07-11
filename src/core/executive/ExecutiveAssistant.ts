@@ -1,114 +1,95 @@
 import { randomUUID } from "crypto";
-import { BaseEmployee } from "../../core/workforce/employee/BaseEmployee";
-import { taskDispatcher } from "../../core/workforce/dispatcher/TaskDispatcher";
-import { employeeRegistry } from "../../core/workforce/registry/EmployeeRegistry";
-import { aiGateway } from "../../core/workforce/gateway/AIGateway";
-import type {
-  EmployeeId,
-  EmployeeRole,
-  EmployeeDepartment,
-  EmployeeSkill,
-  EmployeeTool,
-  EmployeeTask,
-} from "../../core/workforce/employee/types";
+import { aiGateway } from "../workforce/gateway/AIGateway";
+import { employeeRegistry } from "../workforce/registry/EmployeeRegistry";
+import { taskDispatcher } from "../workforce/dispatcher/TaskDispatcher";
+import type { BaseEmployee } from "../workforce/employee/BaseEmployee";
+import type { EmployeeRole, EmployeeTask } from "../workforce/employee/types";
+
+const VALID_ROLES: readonly EmployeeRole[] = [
+  "executive-assistant",
+  "software-engineer",
+  "project-manager",
+  "marketing-strategist",
+  "sales-representative",
+  "outreach-specialist",
+  "financial-analyst",
+  "support-agent",
+  "researcher",
+];
+
+const VALID_PRIORITIES: readonly EmployeeTask["priority"][] = [
+  "low",
+  "medium",
+  "high",
+  "urgent",
+];
 
 /**
- * A single unit of work identified by the planning phase, prior to an
- * employee being assigned to execute it.
+ * The analysed intent behind a raw user request, including its
+ * business classification.
  */
-interface PlannedUnit {
+export interface RequestIntent {
+  readonly summary: string;
+  readonly objective: string;
+  readonly category: string;
+}
+
+/**
+ * A single unit of work identified during planning, tagged with the
+ * specialist role best suited to execute it, prior to an employee
+ * being resolved and a formal task being dispatched.
+ */
+export export interface PlannedUnit {
   readonly title: string;
   readonly description: string;
   readonly role: EmployeeRole;
-  readonly priority: "low" | "medium" | "high" | "urgent";
+  readonly priority: EmployeeTask["priority"];
 }
 
 /**
- * The outcome of a fully monitored execution cycle.
+ * The complete execution plan produced for a single user request.
  */
-interface ExecutionOutcome {
-  readonly completedTaskIds: readonly string[];
-  readonly failedTaskIds: readonly string[];
+export interface ExecutionPlan {
+  readonly intent: RequestIntent;
+  readonly requiredSpecialists: readonly EmployeeRole[];
+  readonly units: readonly PlannedUnit[];
 }
 
 /**
- * The Executive Assistant is the orchestration head of the KDOS AI
- * workforce. It receives requests from Kyle, interprets intent, breaks
- * work into discrete tasks, delegates those tasks to the appropriate
- * specialist employees through the TaskDispatcher, monitors execution,
- * and returns a final result. It never calls an AI provider directly;
- * all AI reasoning is performed through the AIGateway, and all task
- * execution is performed through the TaskDispatcher.
+ * The Executive Assistant is the brain of KDOS. It receives every
+ * request directed at the company, understands intent, classifies the
+ * task, decides which AI employees are required, builds a formal
+ * execution plan, and hands each unit of work to the TaskDispatcher.
+ * It thinks like the CEO of KyleDev — reasoning about business
+ * objectives and workforce composition — and is designed to scale as
+ * the company's autonomous workforce grows. The Executive Assistant
+ * never executes work itself. All AI reasoning flows exclusively
+ * through the AIGateway.
  */
-export class ExecutiveAssistant extends BaseEmployee {
-  private static readonly POLL_INTERVAL_MS = 500;
-  private static readonly MAX_POLL_ATTEMPTS = 240;
-
-  public constructor(params: {
-    id: EmployeeId;
-    name: string;
-    department: EmployeeDepartment;
-    skills: EmployeeSkill[];
-    tools: EmployeeTool[];
-  }) {
-    super({
-      id: params.id,
-      name: params.name,
-      role: "executive-assistant",
-      department: params.department,
-      skills: params.skills,
-      tools: params.tools,
-    });
-  }
-
+export class ExecutiveAssistant {
   /**
-   * Prepares the Executive Assistant for active duty. Validates that
-   * the assistant is correctly registered before accepting work.
+   * Receives a raw user request and drives it end to end through
+   * intent analysis, task classification, specialist identification,
+   * plan generation, and delegation to the TaskDispatcher. Returns the
+   * tasks that were dispatched.
    */
-  public async initialize(): Promise<void> {
-    if (!employeeRegistry.exists(this.id)) {
-      throw new Error(
-        `ExecutiveAssistant: employee "${this.id}" must be registered in the EmployeeRegistry before initialization.`
-      );
-    }
-
-    this.updateStatus("idle");
-  }
-
-  /**
-   * Receives a request from Kyle, plans it into discrete tasks,
-   * delegates those tasks to specialist employees, monitors execution
-   * to completion, and returns a final summarised result.
-   */
-  public async execute(userRequest: string): Promise<string> {
+  public async receiveRequest(userRequest: string): Promise<EmployeeTask[]> {
     if (!userRequest || userRequest.trim().length === 0) {
       throw new Error("ExecutiveAssistant: userRequest is required.");
     }
 
-    this.updateStatus("busy");
+    const intent = await this.analyseIntent(userRequest);
+    const plan = await this.generatePlan(userRequest, intent);
 
-    try {
-      const plannedUnits = await this.plan(userRequest);
-      const tasks = this.delegate(plannedUnits);
-      const outcome = await this.monitor(tasks.map((task) => task.id));
-      const result = this.complete(tasks, outcome);
-
-      this.updateStatus("idle");
-
-      return result;
-    } catch (error) {
-      this.updateStatus("error");
-      throw error;
-    }
+    return this.delegate(plan);
   }
 
   /**
-   * Interprets a natural-language request and breaks it into discrete
-   * planned units of work, each tagged with the role best suited to
-   * execute it. Uses the AIGateway exclusively; never calls an AI
-   * provider directly.
+   * Analyses a raw user request to determine its underlying intent,
+   * business objective, and classification category. Uses the
+   * AIGateway exclusively; never calls an AI provider directly.
    */
-  public async plan(userRequest: string): Promise<PlannedUnit[]> {
+  public async analyseIntent(userRequest: string): Promise<RequestIntent> {
     if (!userRequest || userRequest.trim().length === 0) {
       throw new Error("ExecutiveAssistant: userRequest is required.");
     }
@@ -118,15 +99,14 @@ export class ExecutiveAssistant extends BaseEmployee {
         {
           role: "system",
           content:
-            "You are the planning function of an Executive Assistant inside an internal " +
-            "operating system for a technology agency. Break the user's request into a " +
-            "minimal set of discrete units of work. Respond with ONLY a JSON array, no " +
-            "prose, no markdown fences. Each element must be an object with exactly these " +
-            'fields: "title" (string), "description" (string), "role" (one of: ' +
-            '"executive-assistant", "software-engineer", "project-manager", ' +
-            '"marketing-strategist", "sales-representative", "outreach-specialist", ' +
-            '"financial-analyst", "support-agent", "researcher"), and "priority" (one of: ' +
-            '"low", "medium", "high", "urgent").',
+            "You are the intent-analysis function of the Executive Assistant, the CEO-level " +
+            "intelligence of an internal operating system for a technology agency. Analyse " +
+            "the user's request and respond with ONLY a JSON object, no prose, no markdown " +
+            'fences. The object must have exactly these fields: "summary" (a one-sentence ' +
+            'restatement of what the user is asking for), "objective" (a one-sentence ' +
+            'statement of the underlying business objective this request serves), and ' +
+            '"category" (a short lowercase classification of the task, e.g. "development", ' +
+            '"marketing", "design", "finance", "research", "support", "sales").',
         },
         {
           role: "user",
@@ -135,43 +115,108 @@ export class ExecutiveAssistant extends BaseEmployee {
       ],
     });
 
-    return this.parsePlan(response.content);
+    return this.parseIntent(response.content);
   }
 
   /**
-   * Delegates a set of planned units to the workforce by resolving an
-   * appropriate employee for each unit's role, constructing a formal
-   * EmployeeTask, and dispatching it through the TaskDispatcher. Throws
-   * if no suitable employee exists for a given role.
+   * Determines the required specialist roles for a given intent. Uses
+   * the AIGateway exclusively.
    */
-  public delegate(plannedUnits: PlannedUnit[]): EmployeeTask[] {
-    if (!Array.isArray(plannedUnits) || plannedUnits.length === 0) {
+  public async determineSpecialists(
+    intent: RequestIntent
+  ): Promise<EmployeeRole[]> {
+    if (!intent) {
+      throw new Error("ExecutiveAssistant: intent is required.");
+    }
+
+    const response = await aiGateway.generate({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You determine which specialist AI employee roles are required to fulfil a " +
+            "business objective inside an AI workforce. Respond with ONLY a JSON array of " +
+            'role strings, no prose, no markdown fences. Valid roles are exactly: ' +
+            VALID_ROLES.map((role) => `"${role}"`).join(", ") +
+            ". Include only the roles genuinely required.",
+        },
+        {
+          role: "user",
+          content: `Summary: ${intent.summary}\nObjective: ${intent.objective}\nCategory: ${intent.category}`,
+        },
+      ],
+    });
+
+    return this.parseRoles(response.content);
+  }
+
+  /**
+   * Generates a complete execution plan for a user request: analysed
+   * intent, required specialists, and a breakdown of discrete units of
+   * work tagged with the responsible role. Uses the AIGateway
+   * exclusively.
+   */
+  public async generatePlan(
+    userRequest: string,
+    intent: RequestIntent
+  ): Promise<ExecutionPlan> {
+    if (!userRequest || userRequest.trim().length === 0) {
+      throw new Error("ExecutiveAssistant: userRequest is required.");
+    }
+
+    if (!intent) {
+      throw new Error("ExecutiveAssistant: intent is required.");
+    }
+
+    const requiredSpecialists = await this.determineSpecialists(intent);
+
+    const response = await aiGateway.generate({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are the planning function of the Executive Assistant, the CEO-level " +
+            "intelligence of an internal operating system for a technology agency. Break " +
+            "the request into a minimal set of discrete units of work, each assigned to " +
+            "one of the required specialist roles. Respond with ONLY a JSON array, no " +
+            'prose, no markdown fences. Each element must be an object with exactly these ' +
+            'fields: "title" (string), "description" (string), "role" (one of the ' +
+            'required specialist roles provided), and "priority" (one of: "low", ' +
+            '"medium", "high", "urgent").' +
+            `\n\nRequired specialist roles: ${requiredSpecialists.join(", ")}`,
+        },
+        {
+          role: "user",
+          content: `Original request: ${userRequest}\nObjective: ${intent.objective}\nCategory: ${intent.category}`,
+        },
+      ],
+    });
+
+    const units = this.parsePlanUnits(response.content, requiredSpecialists);
+
+    return { intent, requiredSpecialists, units };
+  }
+
+  /**
+   * Hands a completed execution plan to the TaskDispatcher by
+   * resolving an available employee for each planned unit's role,
+   * constructing a formal EmployeeTask, and dispatching it. Before
+   * accessing the resolved employee's id, its existence is explicitly
+   * validated — an undefined assignee is never permitted to reach
+   * task construction. Throws a descriptive error if no suitable
+   * employee exists for a required role.
+   */
+  public delegate(plan: ExecutionPlan): EmployeeTask[] {
+    if (!plan || !Array.isArray(plan.units) || plan.units.length === 0) {
       throw new Error(
-        "ExecutiveAssistant: plannedUnits must be a non-empty array."
+        "ExecutiveAssistant: plan must contain at least one unit of work."
       );
     }
 
     const tasks: EmployeeTask[] = [];
 
-    for (const unit of plannedUnits) {
-      const candidates = employeeRegistry
-        .getByRole(unit.role)
-        .filter((employee) => employee.getProfile().status === "idle");
-
-      if (candidates.length === 0) {
-        throw new Error(
-          `ExecutiveAssistant: no available employee found for role "${unit.role}".`
-        );
-      }
-
-      const assignee = candidates.find((candidate) => candidate !== undefined);
-
-      if (!assignee) {
-        throw new Error(
-          `ExecutiveAssistant: no valid assignee could be resolved for role "${unit.role}".`
-        );
-      }
-
+    for (const unit of plan.units) {
+      const assignee = this.resolveAssignee(unit.role);
       const now = new Date();
 
       const task: EmployeeTask = {
@@ -196,123 +241,133 @@ export class ExecutiveAssistant extends BaseEmployee {
   }
 
   /**
-   * Polls the TaskDispatcher until every delegated task has either
-   * completed or failed, or the maximum poll attempts are exhausted.
-   * Throws if monitoring times out.
+   * Resolves a single available employee for the given role. Validates
+   * the candidate list before selection and validates the selected
+   * assignee itself before returning it — an undefined assignee can
+   * never be returned from this method. Throws a descriptive error if
+   * no valid assignee can be found.
    */
-  public async monitor(taskIds: string[]): Promise<ExecutionOutcome> {
-    if (!Array.isArray(taskIds) || taskIds.length === 0) {
-      throw new Error("ExecutiveAssistant: taskIds must be a non-empty array.");
+  private resolveAssignee(role: EmployeeRole): BaseEmployee {
+    const candidates = employeeRegistry
+      .getByRole(role)
+      .filter((employee) => employee.getProfile().status === "idle");
+
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      throw new Error(
+        `ExecutiveAssistant: no available employee found for role "${role}".`
+      );
     }
 
-    const pending = new Set(taskIds);
-    const completedTaskIds: string[] = [];
-    const failedTaskIds: string[] = [];
+    const assignee = candidates.find((candidate) => candidate !== undefined);
 
-    for (
-      let attempt = 0;
-      attempt < ExecutiveAssistant.MAX_POLL_ATTEMPTS && pending.size > 0;
-      attempt++
-    ) {
-      const completedIds = new Set(
-        taskDispatcher.completed().map((task) => task.id)
+    if (!assignee) {
+      throw new Error(
+        `ExecutiveAssistant: no valid assignee could be resolved for role "${role}".`
       );
-      const failedIds = new Set(taskDispatcher.failed().map((task) => task.id));
+    }
 
-      for (const taskId of Array.from(pending)) {
-        if (completedIds.has(taskId)) {
-          completedTaskIds.push(taskId);
-          pending.delete(taskId);
-        } else if (failedIds.has(taskId)) {
-          failedTaskIds.push(taskId);
-          pending.delete(taskId);
-        }
-      }
+    return assignee;
+  }
 
-      if (pending.size > 0) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, ExecutiveAssistant.POLL_INTERVAL_MS)
+  /**
+   * Parses and validates the AI-generated intent response.
+   */
+  private parseIntent(rawContent: string): RequestIntent {
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      throw new Error(
+        "ExecutiveAssistant: failed to parse intent response as JSON."
+      );
+    }
+
+    if (typeof parsed !== "object" || parsed === null) {
+      throw new Error(
+        "ExecutiveAssistant: intent response must be a JSON object."
+      );
+    }
+
+    const candidate = parsed as Record<string, unknown>;
+
+    if (
+      typeof candidate.summary !== "string" ||
+      candidate.summary.trim().length === 0
+    ) {
+      throw new Error(
+        "ExecutiveAssistant: intent response has an invalid summary."
+      );
+    }
+
+    if (
+      typeof candidate.objective !== "string" ||
+      candidate.objective.trim().length === 0
+    ) {
+      throw new Error(
+        "ExecutiveAssistant: intent response has an invalid objective."
+      );
+    }
+
+    if (
+      typeof candidate.category !== "string" ||
+      candidate.category.trim().length === 0
+    ) {
+      throw new Error(
+        "ExecutiveAssistant: intent response has an invalid category."
+      );
+    }
+
+    return {
+      summary: candidate.summary,
+      objective: candidate.objective,
+      category: candidate.category,
+    };
+  }
+
+  /**
+   * Parses and validates the AI-generated list of required specialist
+   * roles.
+   */
+  private parseRoles(rawContent: string): EmployeeRole[] {
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      throw new Error(
+        "ExecutiveAssistant: failed to parse specialist roles response as JSON."
+      );
+    }
+
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      throw new Error(
+        "ExecutiveAssistant: specialist roles response must be a non-empty JSON array."
+      );
+    }
+
+    return parsed.map((entry, index) => {
+      if (
+        typeof entry !== "string" ||
+        !VALID_ROLES.includes(entry as EmployeeRole)
+      ) {
+        throw new Error(
+          `ExecutiveAssistant: specialist role at index ${index} is invalid.`
         );
       }
-    }
 
-    if (pending.size > 0) {
-      throw new Error(
-        `ExecutiveAssistant: monitoring timed out waiting for task(s): ${Array.from(
-          pending
-        ).join(", ")}.`
-      );
-    }
-
-    return { completedTaskIds, failedTaskIds };
+      return entry as EmployeeRole;
+    });
   }
 
   /**
-   * Produces the final summarised result for a completed execution
-   * cycle. Throws if any delegated task failed.
+   * Parses and validates the AI-generated plan units, ensuring each
+   * unit's role is among the required specialists.
    */
-  public complete(tasks: EmployeeTask[], outcome: ExecutionOutcome): string {
-    if (!Array.isArray(tasks) || tasks.length === 0) {
-      throw new Error("ExecutiveAssistant: tasks must be a non-empty array.");
-    }
-
-    if (outcome.failedTaskIds.length > 0) {
-      const failedTitles = tasks
-        .filter((task) => outcome.failedTaskIds.includes(task.id))
-        .map((task) => task.title)
-        .join(", ");
-
-      throw new Error(
-        `ExecutiveAssistant: execution failed for task(s): ${failedTitles}.`
-      );
-    }
-
-    const summary = tasks
-      .map((task) => `- ${task.title}: completed`)
-      .join("\n");
-
-    return `All ${tasks.length} task(s) completed successfully.\n${summary}`;
-  }
-
-  /**
-   * Invokes a tool assigned to the Executive Assistant. The Executive
-   * Assistant delegates specialist work to other employees rather than
-   * invoking tools directly; a resolved but unsupported tool
-   * invocation is a deliberate architectural boundary, not a
-   * placeholder.
-   */
-  public async useTool(toolName: string): Promise<unknown> {
-    if (!toolName) {
-      throw new Error("ExecutiveAssistant: toolName is required.");
-    }
-
-    this.resolveTool(toolName);
-
-    throw new Error(
-      `ExecutiveAssistant: direct tool invocation is not supported. ` +
-        `Delegate work requiring "${toolName}" to a specialist employee via the TaskDispatcher.`
-    );
-  }
-
-  /**
-   * Determines whether the Executive Assistant can execute the given
-   * task. The Executive Assistant only executes tasks explicitly
-   * assigned to it; all other work is delegated.
-   */
-  public canExecute(task: EmployeeTask): boolean {
-    if (!task) {
-      throw new Error("ExecutiveAssistant: task is required.");
-    }
-
-    return task.employeeId === this.id && this.status === "idle";
-  }
-
-  /**
-   * Parses and validates the AI-generated plan response into a typed
-   * array of planned units. Throws if the response is not valid JSON
-   * or does not conform to the expected shape.
-   */
-  private parsePlan(rawContent: string): PlannedUnit[] {
+  private parsePlanUnits(
+    rawContent: string,
+    requiredSpecialists: readonly EmployeeRole[]
+  ): PlannedUnit[] {
     let parsed: unknown;
 
     try {
@@ -328,25 +383,6 @@ export class ExecutiveAssistant extends BaseEmployee {
         "ExecutiveAssistant: plan response must be a non-empty JSON array."
       );
     }
-
-    const validRoles: EmployeeRole[] = [
-      "executive-assistant",
-      "software-engineer",
-      "project-manager",
-      "marketing-strategist",
-      "sales-representative",
-      "outreach-specialist",
-      "financial-analyst",
-      "support-agent",
-      "researcher",
-    ];
-
-    const validPriorities: PlannedUnit["priority"][] = [
-      "low",
-      "medium",
-      "high",
-      "urgent",
-    ];
 
     return parsed.map((entry, index) => {
       if (typeof entry !== "object" || entry === null) {
@@ -374,16 +410,16 @@ export class ExecutiveAssistant extends BaseEmployee {
 
       if (
         typeof unit.role !== "string" ||
-        !validRoles.includes(unit.role as EmployeeRole)
+        !requiredSpecialists.includes(unit.role as EmployeeRole)
       ) {
         throw new Error(
-          `ExecutiveAssistant: plan entry at index ${index} has an invalid role.`
+          `ExecutiveAssistant: plan entry at index ${index} has a role outside the required specialists.`
         );
       }
 
       if (
         typeof unit.priority !== "string" ||
-        !validPriorities.includes(unit.priority as PlannedUnit["priority"])
+        !VALID_PRIORITIES.includes(unit.priority as EmployeeTask["priority"])
       ) {
         throw new Error(
           `ExecutiveAssistant: plan entry at index ${index} has an invalid priority.`
@@ -394,8 +430,10 @@ export class ExecutiveAssistant extends BaseEmployee {
         title: unit.title,
         description: unit.description,
         role: unit.role as EmployeeRole,
-        priority: unit.priority as PlannedUnit["priority"],
+        priority: unit.priority as EmployeeTask["priority"],
       };
     });
   }
 }
+
+export const executiveAssistant = new ExecutiveAssistant();

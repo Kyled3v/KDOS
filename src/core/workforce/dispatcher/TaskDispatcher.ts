@@ -1,35 +1,62 @@
+import { randomUUID } from "crypto";
 import { employeeRegistry } from "../registry/EmployeeRegistry";
+import { taskDispatcher as coreDispatcher } from "../dispatcher/TaskDispatcher";
 import type { BaseEmployee } from "../employee/BaseEmployee";
-import type { EmployeeTask } from "../employee/types";
+import type {
+  EmployeeRole as RegistryEmployeeRole,
+  EmployeeTask as RegistryEmployeeTask,
+} from "../employee/types";
+import { EmployeeRole } from "../types/Employee";
+import type {
+  ExecutionPlan,
+  PlannedUnit,
+} from "../../executive/ExecutiveAssistant";
 
 /**
- * Internal record tracking a task currently running with an assigned
- * employee.
+ * Maps the full V2 specialist role catalogue onto the subset of roles
+ * the current EmployeeRegistry is able to resolve employees for. Roles
+ * with no entry here have no supported employee type yet; dispatching
+ * a unit tagged with such a role fails with a descriptive error rather
+ * than being silently misassigned.
  */
-interface RunningTaskRecord {
-  readonly task: EmployeeTask;
-  readonly employeeId: string;
+const REGISTRY_ROLE_MAP: ReadonlyMap<EmployeeRole, RegistryEmployeeRole> = new Map([
+  [EmployeeRole.EXECUTIVE_ASSISTANT, "executive-assistant"],
+  [EmployeeRole.SOFTWARE_ENGINEER, "software-engineer"],
+  [EmployeeRole.PROJECT_MANAGER, "project-manager"],
+  [EmployeeRole.MARKETING_STRATEGIST, "marketing-strategist"],
+  [EmployeeRole.SALES_REPRESENTATIVE, "sales-representative"],
+  [EmployeeRole.OUTREACH_SPECIALIST, "outreach-specialist"],
+  [EmployeeRole.FINANCIAL_ANALYST, "financial-analyst"],
+  [EmployeeRole.SUPPORT_AGENT, "support-agent"],
+  [EmployeeRole.RESEARCHER, "researcher"],
+]);
+
+/**
+ * The outcome of monitoring a batch of dispatched tasks to completion.
+ */
+interface MonitorOutcome {
+  readonly completed: readonly RegistryEmployeeTask[];
+  readonly failed: readonly RegistryEmployeeTask[];
 }
 
 /**
- * Singleton dispatcher responsible for routing tasks to available AI
- * employees, tracking task lifecycle, and keeping employee status in
- * sync with task assignment.
+ * Singleton dispatcher responsible for turning an ExecutionPlan
+ * produced by the Executive Assistant into real work. This is the
+ * ONLY component in KDOS authorised to assign work to an employee: it
+ * resolves the employees required from the EmployeeRegistry, builds a
+ * formal execution queue, dispatches every task, monitors execution to
+ * completion, and merges the results into a single final response.
+ * Every candidate list is validated before use and every resolved
+ * employee is validated before assignment; nothing is ever assigned
+ * on the basis of an unchecked array access.
  */
 export class TaskDispatcher {
   private static instance: TaskDispatcher | null = null;
 
-  private readonly queued: Map<string, EmployeeTask>;
-  private readonly runningTasks: Map<string, RunningTaskRecord>;
-  private readonly completedTasks: Map<string, EmployeeTask>;
-  private readonly failedTasks: Map<string, EmployeeTask>;
+  private static readonly POLL_INTERVAL_MS = 500;
+  private static readonly MAX_POLL_ATTEMPTS = 240;
 
-  private constructor() {
-    this.queued = new Map<string, EmployeeTask>();
-    this.runningTasks = new Map<string, RunningTaskRecord>();
-    this.completedTasks = new Map<string, EmployeeTask>();
-    this.failedTasks = new Map<string, EmployeeTask>();
-  }
+  private constructor() {}
 
   /**
    * Returns the singleton instance of the dispatcher.
@@ -43,71 +70,72 @@ export class TaskDispatcher {
   }
 
   /**
-   * Dispatches a task into the system. Attempts to find and assign an
-   * available employee immediately; if none is available, the task is
-   * placed in the queue. Throws if the task is invalid or already
-   * tracked.
+   * Executes a complete execution plan end to end: resolves required
+   * employees, builds the queue, dispatches every task, monitors
+   * execution, and returns a merged final response. Throws if any
+   * unit's role cannot be resolved to an available employee, or if
+   * any dispatched task fails.
    */
-  public dispatch(task: EmployeeTask): void {
-    this.validateTask(task);
-    this.ensureTaskNotTracked(task.id);
+  public async execute(plan: ExecutionPlan): Promise<string> {
+    this.validatePlan(plan);
 
-    let employee: BaseEmployee;
+    const assignments = this.resolveEmployees(plan);
+    const queue = this.createQueue(plan, assignments);
+    const dispatched = this.dispatchTasks(queue);
+    const outcome = await this.monitorExecution(
+      dispatched.map((task) => task.id)
+    );
 
-    try {
-      employee = this.findBestEmployee(task);
-    } catch {
-      this.queued.set(task.id, task);
-      return;
-    }
-
-    this.assign(employee.id, task);
+    return this.mergeResults(dispatched, outcome);
   }
 
   /**
-   * Assigns a specific task to a specific employee. Throws if the
-   * employee does not exist, is unavailable, cannot execute the task,
-   * or the task is already assigned elsewhere.
+   * Resolves a specific available employee from the EmployeeRegistry
+   * for each planned unit in the plan. Every candidate list is
+   * validated for emptiness before selection, and every selection is
+   * validated for existence before being stored. Throws a descriptive
+   * error if a unit's role has no registry mapping or no available
+   * employee.
    */
-  public assign(employeeId: string, task: EmployeeTask): void {
-    this.validateTask(task);
+  public resolveEmployees(plan: ExecutionPlan): Map<string, BaseEmployee> {
+    this.validatePlan(plan);
 
-    if (!employeeId) {
-      throw new Error("TaskDispatcher: employeeId is required.");
+    const assignments = new Map<string, BaseEmployee>();
+
+    for (const unit of plan.units) {
+      if (assignments.has(unit.id)) {
+        continue;
+      }
+
+      const registryRole = this.resolveRegistryRole(unit.role);
+
+      const candidates = employeeRegistry
+        .getByRole(registryRole)
+        .filter((employee) => employee.getProfile().status === "idle");
+
+      const selected = this.selectEmployee(candidates, unit);
+
+      assignments.set(unit.id, selected);
     }
 
-    if (this.runningTasks.has(task.id)) {
-      throw new Error(
-        `TaskDispatcher: task "${task.id}" is already assigned to an employee.`
-      );
-    }
-
-    const employee = employeeRegistry.get(employeeId);
-
-    if (employee.getProfile().status !== "idle") {
-      throw new Error(
-        `TaskDispatcher: employee "${employeeId}" is not available (status: ${employee.getProfile().status}).`
-      );
-    }
-
-    employee.assignTask(task);
-
-    this.queued.delete(task.id);
-    this.runningTasks.set(task.id, { task, employeeId });
+    return assignments;
   }
 
   /**
-   * Finds the best available employee capable of executing the given
-   * task. Throws if no suitable employee is available.
+   * Maps a V2 specialist role onto the role type the EmployeeRegistry
+   * understands. Throws a descriptive error if the role has no
+   * supported employee type registered yet.
    */
-  public findBestEmployee(task: EmployeeTask): BaseEmployee {
-    this.validateTask(task);
+  private resolveRegistryRole(role: EmployeeRole): RegistryEmployeeRole {
+    const registryRole = REGISTRY_ROLE_MAP.get(role);
 
-    const candidates = employeeRegistry
-      .getAvailable()
-      .filter((employee) => employee.canExecute(task));
+    if (!registryRole) {
+      throw new Error(
+        `TaskDispatcher: role "${role}" has no supported employee type in the EmployeeRegistry yet.`
+      );
+    }
 
-    return this.selectEmployee(candidates, task.id);
+    return registryRole;
   }
 
   /**
@@ -115,21 +143,21 @@ export class TaskDispatcher {
    * employee. Never indexes the array directly — the array is checked
    * for emptiness first, and the selected entry is verified to exist
    * before being returned. Throws a descriptive error if the
-   * candidate list is empty or malformed.
+   * candidate list is empty or contains no valid employee.
    */
   private selectEmployee(
     candidates: BaseEmployee[],
-    taskId: string
+    unit: PlannedUnit
   ): BaseEmployee {
     if (!Array.isArray(candidates)) {
       throw new Error(
-        `TaskDispatcher: candidate list for task "${taskId}" is not an array.`
+        `TaskDispatcher: candidate list for unit "${unit.id}" (role "${unit.role}") is not an array.`
       );
     }
 
     if (candidates.length === 0) {
       throw new Error(
-        `TaskDispatcher: no available employee can execute task "${taskId}".`
+        `TaskDispatcher: no available employee found for unit "${unit.id}" (role "${unit.role}").`
       );
     }
 
@@ -137,7 +165,7 @@ export class TaskDispatcher {
 
     if (!selected) {
       throw new Error(
-        `TaskDispatcher: candidate list for task "${taskId}" contained no valid employee.`
+        `TaskDispatcher: candidate list for unit "${unit.id}" (role "${unit.role}") contained no valid employee.`
       );
     }
 
@@ -145,174 +173,165 @@ export class TaskDispatcher {
   }
 
   /**
-   * Reassigns a task, releasing it from its current employee (if
-   * running) and attempting to dispatch it again. Throws if the task
-   * is not currently tracked by the dispatcher.
+   * Builds a formal execution queue of registry-compatible
+   * EmployeeTask records from the plan's units, using the resolved
+   * employee assignments. Throws if any unit has no resolved
+   * assignment.
    */
-  public reassign(task: EmployeeTask): void {
-    this.validateTask(task);
+  public createQueue(
+    plan: ExecutionPlan,
+    assignments: Map<string, BaseEmployee>
+  ): RegistryEmployeeTask[] {
+    this.validatePlan(plan);
 
-    const running = this.runningTasks.get(task.id);
-
-    if (running) {
-      const employee = employeeRegistry.get(running.employeeId);
-      employee.failTask("Reassigned by dispatcher.");
-      this.runningTasks.delete(task.id);
-    } else if (!this.queued.has(task.id)) {
-      throw new Error(
-        `TaskDispatcher: task "${task.id}" is not tracked by the dispatcher.`
-      );
-    } else {
-      this.queued.delete(task.id);
+    if (!assignments || assignments.size === 0) {
+      throw new Error("TaskDispatcher: assignments must not be empty.");
     }
 
-    this.dispatch(task);
+    const queue: RegistryEmployeeTask[] = [];
+    const now = new Date();
+
+    for (const unit of plan.units) {
+      const employee = assignments.get(unit.id);
+
+      if (!employee) {
+        throw new Error(
+          `TaskDispatcher: no resolved employee for unit "${unit.id}".`
+        );
+      }
+
+      queue.push({
+        id: randomUUID(),
+        employeeId: employee.id,
+        title: unit.title,
+        description: unit.description,
+        status: "pending",
+        priority: unit.priority,
+        workflowId: null,
+        createdAt: now,
+        updatedAt: now,
+        dueAt: null,
+        completedAt: null,
+      });
+    }
+
+    return queue;
   }
 
   /**
-   * Marks a running task as completed and frees its assigned employee.
-   * Throws if the task is not currently running.
+   * Dispatches every task in the queue through the core TaskDispatcher.
+   * Throws if the queue is empty.
    */
-  public complete(taskId: string): void {
-    if (!taskId) {
-      throw new Error("TaskDispatcher: taskId is required.");
+  public dispatchTasks(queue: RegistryEmployeeTask[]): RegistryEmployeeTask[] {
+    if (!Array.isArray(queue) || queue.length === 0) {
+      throw new Error("TaskDispatcher: queue must be a non-empty array.");
     }
 
-    const running = this.runningTasks.get(taskId);
-
-    if (!running) {
-      throw new Error(
-        `TaskDispatcher: task "${taskId}" is not currently running.`
-      );
+    for (const task of queue) {
+      coreDispatcher.dispatch(task);
     }
 
-    const employee = employeeRegistry.get(running.employeeId);
-    employee.completeTask();
-
-    this.runningTasks.delete(taskId);
-    this.completedTasks.set(taskId, running.task);
+    return queue;
   }
 
   /**
-   * Marks a running task as failed with a reason and frees its
-   * assigned employee. Throws if the task is not currently running or
-   * no reason is provided.
+   * Polls the core TaskDispatcher until every task in the batch has
+   * either completed or failed, or the maximum poll attempts are
+   * exhausted. Throws if monitoring times out.
    */
-  public fail(taskId: string, reason: string): void {
-    if (!taskId) {
-      throw new Error("TaskDispatcher: taskId is required.");
+  public async monitorExecution(taskIds: string[]): Promise<MonitorOutcome> {
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      throw new Error("TaskDispatcher: taskIds must be a non-empty array.");
     }
 
-    if (!reason || reason.trim().length === 0) {
-      throw new Error("TaskDispatcher: reason is required.");
-    }
+    const pending = new Set(taskIds);
+    const completed: RegistryEmployeeTask[] = [];
+    const failed: RegistryEmployeeTask[] = [];
 
-    const running = this.runningTasks.get(taskId);
-
-    if (!running) {
-      throw new Error(
-        `TaskDispatcher: task "${taskId}" is not currently running.`
-      );
-    }
-
-    const employee = employeeRegistry.get(running.employeeId);
-    employee.failTask(reason);
-
-    this.runningTasks.delete(taskId);
-    this.failedTasks.set(taskId, running.task);
-  }
-
-  /**
-   * Cancels a task, removing it from the queue or, if running,
-   * releasing its assigned employee back to idle. Throws if the task
-   * is not tracked in either the queue or running set.
-   */
-  public cancel(taskId: string): void {
-    if (!taskId) {
-      throw new Error("TaskDispatcher: taskId is required.");
-    }
-
-    if (this.queued.has(taskId)) {
-      this.queued.delete(taskId);
-      return;
-    }
-
-    const running = this.runningTasks.get(taskId);
-
-    if (!running) {
-      throw new Error(
-        `TaskDispatcher: task "${taskId}" is not tracked by the dispatcher.`
-      );
-    }
-
-    const employee = employeeRegistry.get(running.employeeId);
-    employee.failTask("Cancelled by dispatcher.");
-
-    this.runningTasks.delete(taskId);
-  }
-
-  /**
-   * Returns all tasks currently waiting for assignment.
-   */
-  public queue(): EmployeeTask[] {
-    return Array.from(this.queued.values());
-  }
-
-  /**
-   * Returns all tasks currently running with an assigned employee.
-   */
-  public running(): EmployeeTask[] {
-    return Array.from(this.runningTasks.values()).map((record) => record.task);
-  }
-
-  /**
-   * Returns all tasks that have completed successfully.
-   */
-  public completed(): EmployeeTask[] {
-    return Array.from(this.completedTasks.values());
-  }
-
-  /**
-   * Returns all tasks that have failed.
-   */
-  public failed(): EmployeeTask[] {
-    return Array.from(this.failedTasks.values());
-  }
-
-  /**
-   * Validates the shape of a task before it is dispatched, assigned,
-   * or otherwise tracked.
-   */
-  private validateTask(task: EmployeeTask): void {
-    if (!task) {
-      throw new Error("TaskDispatcher: task is required.");
-    }
-
-    if (!task.id) {
-      throw new Error("TaskDispatcher: task.id is required.");
-    }
-
-    if (!task.employeeId) {
-      throw new Error("TaskDispatcher: task.employeeId is required.");
-    }
-  }
-
-  /**
-   * Ensures a task id is not already tracked anywhere in the
-   * dispatcher's lifecycle maps. Throws if it is.
-   */
-  private ensureTaskNotTracked(taskId: string): void {
-    if (
-      this.queued.has(taskId) ||
-      this.runningTasks.has(taskId) ||
-      this.completedTasks.has(taskId) ||
-      this.failedTasks.has(taskId)
+    for (
+      let attempt = 0;
+      attempt < TaskDispatcher.MAX_POLL_ATTEMPTS && pending.size > 0;
+      attempt++
     ) {
+      const completedTasks = coreDispatcher.completed();
+      const failedTasks = coreDispatcher.failed();
+
+      for (const taskId of Array.from(pending)) {
+        const completedMatch = completedTasks.find(
+          (task) => task.id === taskId
+        );
+
+        if (completedMatch) {
+          completed.push(completedMatch);
+          pending.delete(taskId);
+          continue;
+        }
+
+        const failedMatch = failedTasks.find((task) => task.id === taskId);
+
+        if (failedMatch) {
+          failed.push(failedMatch);
+          pending.delete(taskId);
+        }
+      }
+
+      if (pending.size > 0) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, TaskDispatcher.POLL_INTERVAL_MS)
+        );
+      }
+    }
+
+    if (pending.size > 0) {
       throw new Error(
-        `TaskDispatcher: task "${taskId}" is already tracked by the dispatcher.`
+        `TaskDispatcher: monitoring timed out waiting for task(s): ${Array.from(
+          pending
+        ).join(", ")}.`
       );
+    }
+
+    return { completed, failed };
+  }
+
+  /**
+   * Merges the outcome of a monitored batch into a single final
+   * response string. Throws if any task in the batch failed.
+   */
+  public mergeResults(
+    dispatched: readonly RegistryEmployeeTask[],
+    outcome: MonitorOutcome
+  ): string {
+    if (!Array.isArray(dispatched) || dispatched.length === 0) {
+      throw new Error("TaskDispatcher: dispatched must be a non-empty array.");
+    }
+
+    if (outcome.failed.length > 0) {
+      const failedTitles = outcome.failed.map((task) => task.title).join(", ");
+
+      throw new Error(
+        `TaskDispatcher: execution failed for task(s): ${failedTitles}.`
+      );
+    }
+
+    const summary = outcome.completed
+      .map((task) => `- ${task.title}: completed`)
+      .join("\n");
+
+    return `All ${dispatched.length} task(s) completed successfully.\n${summary}`;
+  }
+
+  /**
+   * Validates the shape of an execution plan before processing.
+   */
+  private validatePlan(plan: ExecutionPlan): void {
+    if (!plan) {
+      throw new Error("TaskDispatcher: plan is required.");
+    }
+
+    if (!Array.isArray(plan.units) || plan.units.length === 0) {
+      throw new Error("TaskDispatcher: plan.units must be a non-empty array.");
     }
   }
 }
 
-export const taskDispatcher = TaskDispatcher.getInstance();
+export const orchestratorDispatcher = TaskDispatcher.getInstance();

@@ -16,7 +16,7 @@ import type {
  * A single unit of work identified by the planning phase, prior to an
  * employee being assigned to execute it.
  */
-interface PlannedUnit {
+export interface PlannedUnit {
   readonly title: string;
   readonly description: string;
   readonly role: EmployeeRole;
