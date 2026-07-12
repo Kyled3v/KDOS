@@ -1,38 +1,49 @@
-import { randomUUID } from "crypto";
+﻿import { randomUUID } from "crypto";
 import { employeeRegistry } from "../registry/EmployeeRegistry";
-import { taskDispatcher as coreDispatcher } from "../dispatcher/TaskDispatcher";
-import type { BaseEmployee } from "../employee/BaseEmployee";
-import type { EmployeeRole, EmployeeTask } from "../employee/types";
+import type { BaseEmployee } from "../employees/BaseEmployee";
 import type {
-  ExecutionPlan,
-  PlannedUnit,
-} from "../../executive/ExecutiveAssistant";
+  EmployeeContext,
+  EmployeeResult,
+  EmployeeTask,
+} from "../types/Employee";
+import type { ExecutionPlan, PlannedUnit } from "../../executive/ExecutiveAssistant";
 
 /**
- * The outcome of monitoring a batch of dispatched tasks to completion.
+ * A task paired with the employee resolved to execute it, prior to
+ * dispatch.
  */
-interface MonitorOutcome {
-  readonly completed: readonly EmployeeTask[];
-  readonly failed: readonly EmployeeTask[];
+interface QueuedWork {
+  readonly task: EmployeeTask;
+  readonly employee: BaseEmployee;
 }
 
 /**
- * Singleton orchestrator responsible for turning an ExecutionPlan
- * produced by the Executive Assistant into real work: resolving the
- * AI employees required, building an execution queue, assigning work
- * through the core TaskDispatcher, monitoring progress to completion,
- * merging results, and returning a single final response.
+ * A dispatched unit of work paired with the in-flight promise tracking
+ * its execution.
+ */
+interface InFlightWork {
+  readonly task: EmployeeTask;
+  readonly promise: Promise<EmployeeResult>;
+}
+
+/**
+ * Singleton dispatcher and the only component in KDOS authorised to
+ * assign and execute work. TaskDispatcher receives an ExecutionPlan
+ * from the Executive Assistant, resolves the employees required from
+ * the EmployeeRegistry, builds a formal execution queue, assigns work
+ * by invoking each employee's execute() method, monitors execution to
+ * completion, and merges the results into a single final response.
+ * Every candidate list is validated before use and every resolved
+ * employee is validated before assignment — nothing is ever assigned
+ * on the basis of an unchecked array access.
  */
 export class TaskDispatcher {
   private static instance: TaskDispatcher | null = null;
 
-  private static readonly POLL_INTERVAL_MS = 500;
-  private static readonly MAX_POLL_ATTEMPTS = 240;
-
   private constructor() {}
 
   /**
-   * Returns the singleton instance of the orchestrator.
+   * Returns the singleton instance of the dispatcher.
    */
   public static getInstance(): TaskDispatcher {
     if (TaskDispatcher.instance === null) {
@@ -44,37 +55,35 @@ export class TaskDispatcher {
 
   /**
    * Executes a complete execution plan end to end: resolves required
-   * employees, builds the queue, assigns work, monitors progress, and
-   * returns a merged final response. Throws if any required role has
-   * no available employee, or if any dispatched task fails.
+   * employees, builds the queue, assigns work, monitors execution, and
+   * returns a merged final response. Throws if any unit's role has no
+   * available employee, or if any dispatched task fails.
    */
   public async execute(plan: ExecutionPlan): Promise<string> {
     this.validatePlan(plan);
 
-    const assignments = this.determineRequiredEmployees(plan);
+    const assignments = this.resolveEmployees(plan);
     const queue = this.createQueue(plan, assignments);
-    const dispatched = this.assignWork(queue);
-    const outcome = await this.monitorProgress(
-      dispatched.map((task) => task.id)
-    );
+    const inFlight = this.assignWork(queue);
+    const results = await this.monitorExecution(inFlight);
 
-    return this.mergeResults(dispatched, outcome);
+    return this.mergeResults(results);
   }
 
   /**
-   * Resolves a specific available employee for each planned unit's
-   * required role. Throws if any required role has no available
-   * employee.
+   * Resolves a specific available employee from the EmployeeRegistry
+   * for each planned unit in the plan. Every candidate list is
+   * validated for emptiness before selection, and every selection is
+   * validated for existence before being stored. Throws a descriptive
+   * error if a unit's role has no available employee.
    */
-  public determineRequiredEmployees(
-    plan: ExecutionPlan
-  ): Map<string, BaseEmployee> {
+  public resolveEmployees(plan: ExecutionPlan): Map<string, BaseEmployee> {
     this.validatePlan(plan);
 
     const assignments = new Map<string, BaseEmployee>();
 
     for (const unit of plan.units) {
-      if (assignments.has(this.unitKey(unit))) {
+      if (assignments.has(unit.id)) {
         continue;
       }
 
@@ -82,45 +91,77 @@ export class TaskDispatcher {
         .getByRole(unit.role)
         .filter((employee) => employee.getProfile().status === "idle");
 
-      if (candidates.length === 0) {
-        throw new Error(
-          `TaskDispatcher: no available employee found for role "${unit.role}".`
-        );
-      }
+      const selected = this.selectEmployee(candidates, unit);
 
-      assignments.set(this.unitKey(unit), candidates[0]);
+      assignments.set(unit.id, selected);
     }
 
     return assignments;
   }
 
   /**
-   * Builds a formal execution queue of EmployeeTask records from the
-   * plan's units, using the resolved employee assignments.
+   * Validates a candidate list of employees resolved for a planned
+   * unit and returns the selected employee. Never indexes the array
+   * directly — the array is checked for emptiness first, and the
+   * selected entry is verified to exist before being returned. Throws
+   * a descriptive error if the candidate list is empty or contains no
+   * valid employee.
+   */
+  private selectEmployee(
+    candidates: BaseEmployee[],
+    unit: PlannedUnit
+  ): BaseEmployee {
+    if (!Array.isArray(candidates)) {
+      throw new Error(
+        `TaskDispatcher: candidate list for unit "${unit.id}" (role "${unit.role}") is not an array.`
+      );
+    }
+
+    if (candidates.length === 0) {
+      throw new Error(
+        `TaskDispatcher: no available employee found for unit "${unit.id}" (role "${unit.role}").`
+      );
+    }
+
+    const selected = candidates.find((candidate) => candidate !== undefined);
+
+    if (!selected) {
+      throw new Error(
+        `TaskDispatcher: candidate list for unit "${unit.id}" (role "${unit.role}") contained no valid employee.`
+      );
+    }
+
+    return selected;
+  }
+
+  /**
+   * Builds a formal execution queue of EmployeeTask records paired
+   * with their resolved employee, from the plan's units. Throws if
+   * any unit has no resolved assignment.
    */
   public createQueue(
     plan: ExecutionPlan,
     assignments: Map<string, BaseEmployee>
-  ): EmployeeTask[] {
+  ): QueuedWork[] {
     this.validatePlan(plan);
 
     if (!assignments || assignments.size === 0) {
       throw new Error("TaskDispatcher: assignments must not be empty.");
     }
 
-    const queue: EmployeeTask[] = [];
+    const queue: QueuedWork[] = [];
     const now = new Date();
 
     for (const unit of plan.units) {
-      const employee = assignments.get(this.unitKey(unit));
+      const employee = assignments.get(unit.id);
 
       if (!employee) {
         throw new Error(
-          `TaskDispatcher: no resolved employee for unit "${unit.title}".`
+          `TaskDispatcher: no resolved employee for unit "${unit.id}".`
         );
       }
 
-      queue.push({
+      const task: EmployeeTask = {
         id: randomUUID(),
         employeeId: employee.id,
         title: unit.title,
@@ -132,116 +173,108 @@ export class TaskDispatcher {
         updatedAt: now,
         dueAt: null,
         completedAt: null,
-      });
+      };
+
+      queue.push({ task, employee });
     }
 
     return queue;
   }
 
   /**
-   * Dispatches every task in the queue through the core TaskDispatcher.
-   * Throws if the queue is empty.
+   * Assigns every item in the queue by invoking its resolved
+   * employee's execute() method, returning the in-flight work so
+   * execution can be monitored. Throws if the queue is empty.
    */
-  public assignWork(queue: EmployeeTask[]): EmployeeTask[] {
+  public assignWork(queue: QueuedWork[]): InFlightWork[] {
     if (!Array.isArray(queue) || queue.length === 0) {
       throw new Error("TaskDispatcher: queue must be a non-empty array.");
     }
 
-    for (const task of queue) {
-      coreDispatcher.dispatch(task);
-    }
+    const context: EmployeeContext = {
+      requestId: randomUUID(),
+      workflowId: null,
+      correlationId: randomUUID(),
+      metadata: {},
+    };
 
-    return queue;
+    return queue.map(({ task, employee }) => ({
+      task,
+      promise: employee.execute(task, context),
+    }));
   }
 
   /**
-   * Polls the core TaskDispatcher until every task in the batch has
-   * either completed or failed, or the maximum poll attempts are
-   * exhausted. Throws if monitoring times out.
+   * Monitors a batch of in-flight work to completion, awaiting every
+   * execution. A rejected execution (an employee that threw rather
+   * than returning a failure EmployeeResult) is converted into a
+   * synthetic failure result so monitoring always resolves with a
+   * complete, well-formed result set.
    */
-  public async monitorProgress(taskIds: string[]): Promise<MonitorOutcome> {
-    if (!Array.isArray(taskIds) || taskIds.length === 0) {
-      throw new Error("TaskDispatcher: taskIds must be a non-empty array.");
+  public async monitorExecution(
+    inFlight: InFlightWork[]
+  ): Promise<EmployeeResult[]> {
+    if (!Array.isArray(inFlight) || inFlight.length === 0) {
+      throw new Error("TaskDispatcher: inFlight must be a non-empty array.");
     }
 
-    const pending = new Set(taskIds);
-    const completed: EmployeeTask[] = [];
-    const failed: EmployeeTask[] = [];
+    const settled = await Promise.allSettled(
+      inFlight.map((work) => work.promise)
+    );
 
-    for (
-      let attempt = 0;
-      attempt < TaskDispatcher.MAX_POLL_ATTEMPTS && pending.size > 0;
-      attempt++
-    ) {
-      const completedTasks = coreDispatcher.completed();
-      const failedTasks = coreDispatcher.failed();
+    return settled.map((outcome, index) => {
+      const work = inFlight[index];
 
-      for (const taskId of Array.from(pending)) {
-        const completedMatch = completedTasks.find(
-          (task) => task.id === taskId
-        );
-
-        if (completedMatch) {
-          completed.push(completedMatch);
-          pending.delete(taskId);
-          continue;
-        }
-
-        const failedMatch = failedTasks.find((task) => task.id === taskId);
-
-        if (failedMatch) {
-          failed.push(failedMatch);
-          pending.delete(taskId);
-        }
-      }
-
-      if (pending.size > 0) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, TaskDispatcher.POLL_INTERVAL_MS)
+      if (!work) {
+        throw new Error(
+          `TaskDispatcher: no in-flight work found at index ${index}.`
         );
       }
-    }
 
-    if (pending.size > 0) {
-      throw new Error(
-        `TaskDispatcher: monitoring timed out waiting for task(s): ${Array.from(
-          pending
-        ).join(", ")}.`
-      );
-    }
+      if (outcome.status === "fulfilled") {
+        return outcome.value;
+      }
 
-    return { completed, failed };
+      const message =
+        outcome.reason instanceof Error
+          ? outcome.reason.message
+          : "Unknown error occurred.";
+
+      return {
+        taskId: work.task.id,
+        employeeId: work.task.employeeId,
+        success: false,
+        summary: `Task "${work.task.title}" failed: ${message}`,
+        output: null,
+        issues: [],
+        suggestions: [],
+        completedAt: new Date(),
+      };
+    });
   }
 
   /**
-   * Merges the outcome of a monitored batch into a single final
-   * response string. Throws if any task in the batch failed.
+   * Merges a batch of results into a single final response string.
+   * Throws if any result in the batch was unsuccessful.
    */
-  public mergeResults(
-    dispatched: readonly EmployeeTask[],
-    outcome: MonitorOutcome
-  ): string {
-    if (!Array.isArray(dispatched) || dispatched.length === 0) {
-      throw new Error(
-        "TaskDispatcher: dispatched must be a non-empty array."
-      );
+  public mergeResults(results: EmployeeResult[]): string {
+    if (!Array.isArray(results) || results.length === 0) {
+      throw new Error("TaskDispatcher: results must be a non-empty array.");
     }
 
-    if (outcome.failed.length > 0) {
-      const failedTitles = outcome.failed
-        .map((task) => task.title)
-        .join(", ");
+    const failed = results.filter((result) => !result.success);
 
-      throw new Error(
-        `TaskDispatcher: execution failed for task(s): ${failedTitles}.`
-      );
+    if (failed.length > 0) {
+      const failedSummaries = failed.map((result) => result.summary).join("; ");
+
+      throw new Error(`TaskDispatcher: execution failed: ${failedSummaries}.`);
     }
 
-    const summary = outcome.completed
-      .map((task) => `- ${task.title}: completed`)
+    const summary = results
+      .map((result) => `- ${result.summary}`)
       .join("\n");
 
-    return `All ${dispatched.length} task(s) completed successfully.\n${summary}`;
+    return `All ${results.length} task(s) completed successfully.\n${summary}`;
   }
 
   /**
@@ -253,19 +286,9 @@ export class TaskDispatcher {
     }
 
     if (!Array.isArray(plan.units) || plan.units.length === 0) {
-      throw new Error(
-        "TaskDispatcher: plan.units must be a non-empty array."
-      );
+      throw new Error("TaskDispatcher: plan.units must be a non-empty array.");
     }
-  }
-
-  /**
-   * Builds a stable key for a planned unit's role to deduplicate
-   * employee resolution across units that share a role.
-   */
-  private unitKey(unit: PlannedUnit): EmployeeRole {
-    return unit.role;
   }
 }
 
-export const orchestratorDispatcher = TaskDispatcher.getInstance();
+export const taskDispatcher = TaskDispatcher.getInstance();

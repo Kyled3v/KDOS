@@ -1,4 +1,4 @@
-import type { EmployeeMemory, EmployeeMemoryType } from "../employee/types";
+import type { EmployeeMemory, EmployeeMemoryType } from "../types/Employee";
 
 /**
  * Criteria used to search across stored memories.
@@ -55,10 +55,9 @@ class InMemoryMemoryStore implements MemoryStore {
 }
 
 /**
- * Singleton engine providing memory storage and retrieval services to
- * every AI employee in KDOS. The underlying storage mechanism is
- * abstracted behind MemoryStore so it can later be backed by
- * PostgreSQL/Supabase without changing this public API.
+ * Singleton engine responsible for storing, retrieving, and searching
+ * EmployeeMemory records. MemoryEngine manages EmployeeMemory only —
+ * it holds no knowledge of employees, tasks, or execution.
  */
 export class MemoryEngine {
   private static instance: MemoryEngine | null = null;

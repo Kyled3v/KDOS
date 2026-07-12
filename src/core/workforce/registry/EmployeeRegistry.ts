@@ -1,10 +1,10 @@
-import type { BaseEmployee } from "../employee/BaseEmployee";
-import type { EmployeeRole, EmployeeDepartment } from "../employee/types";
+﻿import type { BaseEmployee } from "../employees/BaseEmployee";
+import type { EmployeeDepartment, EmployeeRole } from "../types/Employee";
 
 /**
  * Singleton registry responsible for tracking every AI employee active
- * within KDOS. All employee lifecycle management flows through this
- * registry.
+ * within KDOS. EmployeeRegistry works exclusively with BaseEmployee —
+ * it holds no knowledge of any specific employee implementation.
  */
 export class EmployeeRegistry {
   private static instance: EmployeeRegistry | null = null;
@@ -98,9 +98,7 @@ export class EmployeeRegistry {
       throw new Error("EmployeeRegistry: role is required.");
     }
 
-    return this.getAll().filter(
-      (employee) => employee.role === role
-    );
+    return this.getAll().filter((employee) => employee.role === role);
   }
 
   /**

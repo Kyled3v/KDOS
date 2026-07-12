@@ -1,34 +1,49 @@
 /**
- * Base contracts for every AI employee in KDOS V2. This file defines
- * no implementation — it establishes the shared shape every current
- * and future AI employee must conform to, whether KDOS employs a
- * handful of employees or several hundred.
+ * The canonical employee domain model for KDOS. This file is the
+ * single source of truth for the entire workforce core — every other
+ * file in the workforce core depends on these types and only these
+ * types.
  */
 
 /**
  * The full catalogue of specialist roles an AI employee may occupy.
- * New roles are added here as the workforce grows; no employee may
- * declare a role outside this enum.
  */
 export enum EmployeeRole {
   EXECUTIVE_ASSISTANT = "executive-assistant",
   SOFTWARE_ENGINEER = "software-engineer",
-  QA_ENGINEER = "qa-engineer",
-  DEVOPS_ENGINEER = "devops-engineer",
-  CYBERSECURITY_ENGINEER = "cybersecurity-engineer",
   PROJECT_MANAGER = "project-manager",
-  GRAPHIC_DESIGNER = "graphic-designer",
-  CONTENT_CREATOR = "content-creator",
   MARKETING_STRATEGIST = "marketing-strategist",
   SALES_REPRESENTATIVE = "sales-representative",
   OUTREACH_SPECIALIST = "outreach-specialist",
   FINANCIAL_ANALYST = "financial-analyst",
-  DATA_ANALYST = "data-analyst",
   SUPPORT_AGENT = "support-agent",
   RESEARCHER = "researcher",
-  LEGAL_ADVISOR = "legal-advisor",
-  HR_MANAGER = "hr-manager",
 }
+
+/**
+ * The department an employee belongs to within KyleDev.
+ */
+export enum EmployeeDepartment {
+  EXECUTIVE = "executive",
+  ENGINEERING = "engineering",
+  PRODUCT = "product",
+  MARKETING = "marketing",
+  SALES = "sales",
+  FINANCE = "finance",
+  SUPPORT = "support",
+  RESEARCH = "research",
+}
+
+/**
+ * The current operational status of an employee.
+ */
+export type EmployeeStatus =
+  | "active"
+  | "idle"
+  | "busy"
+  | "paused"
+  | "offline"
+  | "error";
 
 /**
  * The urgency level of a unit of work assigned to an employee.
@@ -36,23 +51,36 @@ export enum EmployeeRole {
 export type EmployeeTaskPriority = "low" | "medium" | "high" | "urgent";
 
 /**
- * A unit of work assigned to an AI employee. This is the sole input
- * surface for employee execution — employees never receive raw user
- * input directly.
+ * The lifecycle status of a task assigned to an employee.
+ */
+export type EmployeeTaskStatus =
+  | "pending"
+  | "in-progress"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+/**
+ * A unit of work assigned to an employee.
  */
 export interface EmployeeTask {
   readonly id: string;
+  readonly employeeId: string;
   readonly title: string;
   readonly description: string;
-  readonly role: EmployeeRole;
+  readonly status: EmployeeTaskStatus;
   readonly priority: EmployeeTaskPriority;
-  readonly metadata: Readonly<Record<string, unknown>>;
+  readonly workflowId: string | null;
   readonly createdAt: Date;
+  readonly updatedAt: Date;
+  readonly dueAt: Date | null;
+  readonly completedAt: Date | null;
 }
 
 /**
- * The structured outcome of an employee's execution of a task. This
- * is the sole output surface for employee execution — employees never
+ * The structured outcome of an employee's execution of a task. This is
+ * the sole output surface for employee execution — employees never
  * communicate results directly to the user.
  */
 export interface EmployeeResult {
@@ -79,15 +107,55 @@ export interface EmployeeContext {
 }
 
 /**
+ * The classification of a stored memory entry.
+ */
+export type EmployeeMemoryType =
+  | "short-term"
+  | "long-term"
+  | "episodic"
+  | "procedural";
+
+/**
+ * A unit of memory retained by an employee. This shape is the
+ * contract the MemoryEngine stores, retrieves, and searches against.
+ */
+export interface EmployeeMemory {
+  readonly id: string;
+  readonly employeeId: string;
+  readonly type: EmployeeMemoryType;
+  readonly content: string;
+  readonly context: Readonly<Record<string, unknown>>;
+  readonly createdAt: Date;
+  readonly expiresAt: Date | null;
+}
+
+/**
+ * The complete profile record for an AI employee, as returned by
+ * Employee.getProfile(). Always includes the employee's current
+ * status, department, role, and the timestamp it was last active.
+ */
+export interface EmployeeProfile {
+  readonly id: string;
+  readonly name: string;
+  readonly role: EmployeeRole;
+  readonly department: EmployeeDepartment;
+  readonly status: EmployeeStatus;
+  readonly lastActive: Date;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+}
+
+/**
  * The contract every AI employee in KDOS must implement, regardless of
  * role, department, or seniority. This interface is the single point
  * of integration between the workforce and the systems that dispatch
- * work to it (the TaskDispatcher and its orchestrators).
+ * work to it.
  */
 export interface Employee {
   readonly id: string;
   readonly name: string;
   readonly role: EmployeeRole;
-  readonly description: string;
+  readonly department: EmployeeDepartment;
+  getProfile(): EmployeeProfile;
   execute(task: EmployeeTask, context: EmployeeContext): Promise<EmployeeResult>;
 }
