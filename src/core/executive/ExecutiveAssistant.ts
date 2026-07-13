@@ -1,229 +1,145 @@
-import { randomUUID } from "crypto";
-import { EmployeeRole, type EmployeeTaskPriority } from "../workforce/types/Employee";
+/**
+ * ExecutiveAssistant.ts
+ *
+ * Location: src/core/executive/ExecutiveAssistant.ts
+ *
+ * ExecutiveAssistant is the top-level coordinator of the Executive
+ * layer. It owns no execution logic and performs no dispatch — it
+ * simply runs an incoming request through the existing reasoning
+ * pipeline (analysis -> classification -> breakdown -> planning ->
+ * decision) and returns the combined result as an ExecutivePackage.
+ *
+ * ExecutiveAssistant ONLY thinks. It never dispatches work, never
+ * creates employees, never calls TaskDispatcher, and never talks to
+ * AI directly — each of those responsibilities belongs to the
+ * components it coordinates, or to layers outside the Executive
+ * layer entirely.
+ */
+
+import { IntentAnalyzer } from './IntentAnalyzer'
+import type { Intent } from './IntentAnalyzer'
+import { ObjectiveClassifier } from './ObjectiveClassifier'
+import type { Objective } from './ObjectiveClassifier'
+import { TaskBreakdownEngine } from './TaskBreakdownEngine'
+import type { PlannedUnit } from './TaskBreakdownEngine'
+import { ExecutionPlanner } from './ExecutionPlanner'
+import type { ExecutionPlan } from './ExecutionPlanner'
+import { DecisionEngine } from './DecisionEngine'
+import type { ExecutiveDecision } from './DecisionEngine'
 
 /**
- * A single unit of work identified during planning, tagged with the
- * specialist role and priority best suited to it. A PlannedUnit
- * describes what needs to happen — it carries no information about
- * who will perform the work or how it will be executed.
+ * The complete output of a single pass through the Executive
+ * reasoning pipeline. This is the sole artifact ExecutiveAssistant
+ * produces — it contains only reasoning results, never execution
+ * instructions or side effects.
  */
-export interface PlannedUnit {
-  readonly id: string;
-  readonly title: string;
-  readonly description: string;
-  readonly role: EmployeeRole;
-  readonly priority: EmployeeTaskPriority;
+export interface ExecutivePackage {
+  readonly intent: Intent
+  readonly objective: Objective
+  readonly plannedUnits: PlannedUnit[]
+  readonly executionPlan: ExecutionPlan
+  readonly decision: ExecutiveDecision
 }
 
 /**
- * The complete execution plan produced for a single user request.
- */
-export interface ExecutionPlan {
-  readonly units: PlannedUnit[];
-}
-
-/**
- * Keyword signals used to classify a clause of a request against the
- * canonical specialist role best suited to address it. Order matters:
- * earlier entries take precedence when multiple roles match.
- */
-const ROLE_SIGNALS: ReadonlyArray<readonly [EmployeeRole, readonly string[]]> = [
-  [
-    EmployeeRole.SOFTWARE_ENGINEER,
-    ["build", "develop", "code", "implement", "api", "database", "app", "feature", "bug", "refactor", "test"],
-  ],
-  [
-    EmployeeRole.MARKETING_STRATEGIST,
-    ["marketing", "campaign", "advertis", "seo", "brand awareness"],
-  ],
-  [
-    EmployeeRole.SALES_REPRESENTATIVE,
-    ["sales", "sell", "close a deal", "pitch", "prospect"],
-  ],
-  [
-    EmployeeRole.OUTREACH_SPECIALIST,
-    ["outreach", "cold email", "cold call", "partnership", "networking"],
-  ],
-  [
-    EmployeeRole.FINANCIAL_ANALYST,
-    ["budget", "finance", "financial", "invoice", "revenue", "cost", "pricing"],
-  ],
-  [
-    EmployeeRole.SUPPORT_AGENT,
-    ["support", "customer service", "ticket", "complaint", "help desk"],
-  ],
-  [
-    EmployeeRole.RESEARCHER,
-    ["research", "investigate", "analyse", "analyze", "study", "explore options"],
-  ],
-  [
-    EmployeeRole.EXECUTIVE_ASSISTANT,
-    ["schedule", "calendar", "coordinate meeting", "book a", "organise a meeting"],
-  ],
-];
-
-/**
- * Keyword signals used to classify the urgency of a clause.
- */
-const URGENT_SIGNALS: readonly string[] = [
-  "urgent",
-  "asap",
-  "immediately",
-  "right now",
-  "critical",
-  "emergency",
-];
-
-const HIGH_SIGNALS: readonly string[] = [
-  "important",
-  "priority",
-  "soon",
-  "this week",
-];
-
-const LOW_SIGNALS: readonly string[] = [
-  "eventually",
-  "when you have time",
-  "low priority",
-  "nice to have",
-  "whenever",
-];
-
-/**
- * The Executive Assistant is the brain of KDOS. It receives every
- * request directed at the company and is responsible solely for
- * analysing the underlying business objective, determining the
- * workforce required, and breaking that request into discrete
- * PlannedUnits, returned as an ExecutionPlan. The Executive Assistant
- * does not dispatch work, does not execute work, and does not call
- * any AI provider or AI Gateway — the TaskDispatcher is the only
- * component authorised to assign and execute work. The only
- * dependency this class has is a type-only reference to the canonical
- * EmployeeRole and EmployeeTaskPriority types, ensuring every plan it
- * produces is structurally compatible with the workforce that
- * ultimately resolves it.
+ * ExecutiveAssistant
+ *
+ * Single responsibility: coordinate the existing Executive-layer
+ * components into one deterministic reasoning pipeline and return the
+ * resulting ExecutivePackage.
+ *
+ * This class:
+ *   - Owns instances of IntentAnalyzer, ObjectiveClassifier,
+ *     TaskBreakdownEngine, ExecutionPlanner, and DecisionEngine.
+ *   - Performs no AI calls of its own.
+ *   - Performs no execution, task dispatch, or employee creation.
+ *   - Delegates every unit of reasoning to the appropriate component;
+ *     it never re-implements their logic.
  */
 export class ExecutiveAssistant {
-  /**
-   * Receives a raw user request and returns a complete ExecutionPlan.
-   * This is the sole entry point into the Executive Assistant.
-   */
-  public receiveRequest(userRequest: string): ExecutionPlan {
-    if (!userRequest || userRequest.trim().length === 0) {
-      throw new Error("ExecutiveAssistant: userRequest is required.");
-    }
+  private readonly intentAnalyzer: IntentAnalyzer
+  private readonly objectiveClassifier: ObjectiveClassifier
+  private readonly taskBreakdownEngine: TaskBreakdownEngine
+  private readonly executionPlanner: ExecutionPlanner
+  private readonly decisionEngine: DecisionEngine
 
-    const objective = this.analyseObjective(userRequest);
-    const clauses = this.determineRequiredWorkforce(objective);
-    const units = this.createPlannedUnits(clauses);
-
-    if (units.length === 0) {
-      throw new Error(
-        "ExecutiveAssistant: no actionable units of work could be identified in the request."
-      );
-    }
-
-    return { units };
+  public constructor(
+    intentAnalyzer: IntentAnalyzer = new IntentAnalyzer(),
+    objectiveClassifier: ObjectiveClassifier = new ObjectiveClassifier(),
+    taskBreakdownEngine: TaskBreakdownEngine = new TaskBreakdownEngine(),
+    executionPlanner: ExecutionPlanner = new ExecutionPlanner(),
+    decisionEngine: DecisionEngine = new DecisionEngine()
+  ) {
+    this.intentAnalyzer = intentAnalyzer
+    this.objectiveClassifier = objectiveClassifier
+    this.taskBreakdownEngine = taskBreakdownEngine
+    this.executionPlanner = executionPlanner
+    this.decisionEngine = decisionEngine
   }
 
   /**
-   * Normalises a raw user request into a single analysable objective
-   * statement: trimmed, whitespace-collapsed, and stripped of
-   * conversational filler that carries no business meaning.
+   * Runs a raw request string through the full Executive reasoning
+   * pipeline and returns the resulting ExecutivePackage.
+   *
+   * Pipeline:
+   *   analyze()   -> Intent
+   *   classify()  -> Objective
+   *   breakdown() -> PlannedUnit[]
+   *   createPlan() -> ExecutionPlan
+   *   makeDecision() -> ExecutiveDecision
+   *
+   * @param request - The raw incoming request to reason about.
+   * @returns The complete ExecutivePackage for this request. No work
+   *          is executed or dispatched as part of producing it.
    */
-  private analyseObjective(userRequest: string): string {
-    const collapsed = userRequest.replace(/\s+/g, " ").trim();
+  public async evaluate(request: string): Promise<ExecutivePackage> {
+    const intent = await this.analyze(request)
+    const objective = await this.classify(intent)
+    const plannedUnits = await this.breakdown(objective)
+    const executionPlan = this.createPlan(plannedUnits)
+    const decision = this.makeDecision(executionPlan)
 
-    const filler = /^(please|hey|hi|could you|can you|i need you to|i want you to)\s+/i;
-
-    return collapsed.replace(filler, "").trim();
+    return Object.freeze({
+      intent,
+      objective,
+      plannedUnits,
+      executionPlan,
+      decision,
+    })
   }
 
   /**
-   * Determines the discrete units of required workforce within an
-   * objective statement by splitting it into clauses along sentence
-   * boundaries, line breaks, numbered/bulleted list markers, and
-   * coordinating conjunctions.
+   * Delegates intent analysis to IntentAnalyzer.
    */
-  private determineRequiredWorkforce(objective: string): string[] {
-    const rawClauses = objective
-      .split(/\r?\n|(?<=[.!?])\s+|,?\s+and then\s+|,?\s+and also\s+|;\s*/i)
-      .map((clause) => clause.replace(/^[-*\d.)\s]+/, "").trim())
-      .filter((clause) => clause.length > 0);
-
-    return rawClauses.length > 0 ? rawClauses : [objective];
+  private async analyze(request: string): Promise<Intent> {
+    return this.intentAnalyzer.analyze(request)
   }
 
   /**
-   * Converts a list of clauses into formal PlannedUnits, classifying
-   * each clause's specialist role and priority from its content.
+   * Delegates objective classification to ObjectiveClassifier.
    */
-  private createPlannedUnits(clauses: string[]): PlannedUnit[] {
-    return clauses.map((clause) => ({
-      id: randomUUID(),
-      title: this.buildTitle(clause),
-      description: clause,
-      role: this.classifyRole(clause),
-      priority: this.classifyPriority(clause),
-    }));
+  private async classify(intent: Intent): Promise<Objective> {
+    return this.objectiveClassifier.classify(intent)
   }
 
   /**
-   * Derives a short title from a clause by truncating at a natural
-   * word boundary.
+   * Delegates task breakdown to TaskBreakdownEngine.
    */
-  private buildTitle(clause: string): string {
-    const maxLength = 60;
-
-    if (clause.length <= maxLength) {
-      return clause;
-    }
-
-    const truncated = clause.slice(0, maxLength);
-    const lastSpace = truncated.lastIndexOf(" ");
-
-    return `${lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated}...`;
+  private async breakdown(objective: Objective): Promise<PlannedUnit[]> {
+    return this.taskBreakdownEngine.breakdown(objective)
   }
 
   /**
-   * Classifies the specialist role best suited to a clause based on
-   * keyword signals. Defaults to PROJECT_MANAGER when no signal
-   * matches, since coordinating unclassified work is itself a
-   * legitimate project-management responsibility.
+   * Delegates deterministic plan construction to ExecutionPlanner.
    */
-  private classifyRole(clause: string): EmployeeRole {
-    const normalised = clause.toLowerCase();
-
-    for (const [role, keywords] of ROLE_SIGNALS) {
-      if (keywords.some((keyword) => normalised.includes(keyword))) {
-        return role;
-      }
-    }
-
-    return EmployeeRole.PROJECT_MANAGER;
+  private createPlan(units: PlannedUnit[]): ExecutionPlan {
+    return this.executionPlanner.createPlan(units)
   }
 
   /**
-   * Classifies the priority of a clause based on keyword signals.
-   * Defaults to "medium" when no signal matches.
+   * Delegates final executive decision-making to DecisionEngine.
    */
-  private classifyPriority(clause: string): EmployeeTaskPriority {
-    const normalised = clause.toLowerCase();
-
-    if (URGENT_SIGNALS.some((keyword) => normalised.includes(keyword))) {
-      return "urgent";
-    }
-
-    if (HIGH_SIGNALS.some((keyword) => normalised.includes(keyword))) {
-      return "high";
-    }
-
-    if (LOW_SIGNALS.some((keyword) => normalised.includes(keyword))) {
-      return "low";
-    }
-
-    return "medium";
+  private makeDecision(plan: ExecutionPlan): ExecutiveDecision {
+    return this.decisionEngine.makeDecision(plan)
   }
 }
-
-export const executiveAssistant = new ExecutiveAssistant();
