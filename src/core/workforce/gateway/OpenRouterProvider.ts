@@ -1,274 +1,225 @@
-import OpenAI from "openai";
-import type {
-  AIProvider,
-  AIRequest,
-  AIResponse,
-  AIMessage,
-} from "./AIGateway";
-
-const BASE_URL = "https://openrouter.ai/api/v1";
-const DEFAULT_TIMEOUT_MS = 30_000;
+/**
+ * OpenRouterProvider.ts
+ *
+ * Location: src/core/workforce/gateway/OpenRouterProvider.ts
+ *
+ * OpenRouterProvider is the ONLY class in KDOS responsible for
+ * communicating with OpenRouter. It sends chat completion requests
+ * via fetch() and returns the assistant's message content, throwing
+ * descriptive errors on any failure.
+ *
+ * This class performs no reasoning, no task orchestration, and no
+ * employee logic — it is a thin, strongly-typed transport layer over
+ * the OpenRouter chat completions API.
+ */
 
 /**
- * Configuration options for constructing an OpenRouterProvider instance.
+ * A single chat message, matching the OpenRouter/OpenAI-style
+ * chat completions message shape.
  */
-export interface OpenRouterProviderConfig {
-  readonly maxRetries?: number;
-  readonly retryDelayMs?: number;
-  readonly timeoutMs?: number;
+export interface ChatMessage {
+  readonly role: 'system' | 'user' | 'assistant'
+  readonly content: string
 }
 
 /**
- * AIProvider adapter for OpenRouter. OpenRouter exposes an
- * OpenAI-compatible API, so this adapter uses the official OpenAI SDK
- * pointed at OpenRouter's endpoint. All OpenRouter-specific
- * configuration lives entirely inside this adapter, never inside the
- * gateway or an employee.
+ * The request body sent to OpenRouter's chat completions endpoint.
  */
-export class OpenRouterProvider implements AIProvider {
-  public readonly name = "openrouter";
+interface OpenRouterRequestBody {
+  readonly model: string
+  readonly messages: ChatMessage[]
+  readonly temperature: number
+}
 
-  private readonly client: OpenAI;
-  private readonly defaultModel: string;
-  private readonly maxRetries: number;
-  private readonly retryDelayMs: number;
-  private readonly timeoutMs: number;
+/**
+ * A single choice returned by OpenRouter's chat completions endpoint.
+ */
+interface OpenRouterChoice {
+  readonly message?: {
+    readonly content?: string
+  }
+}
 
-  public constructor(config?: OpenRouterProviderConfig) {
-    const apiKey = process.env.OPENROUTER_API_KEY;
+/**
+ * The successful response shape returned by OpenRouter's chat
+ * completions endpoint.
+ */
+interface OpenRouterSuccessResponse {
+  readonly choices?: OpenRouterChoice[]
+}
+
+/**
+ * The error shape OpenRouter returns in its response body when a
+ * request fails.
+ */
+interface OpenRouterErrorResponse {
+  readonly error?: {
+    readonly message?: string
+  }
+}
+
+/**
+ * The OpenRouter chat completions endpoint.
+ */
+const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
+
+/**
+ * Default model used when OPENROUTER_MODEL is not set in the
+ * environment. This is the only model name permitted to be
+ * hardcoded in this file.
+ */
+const DEFAULT_MODEL = 'moonshotai/kimi-k2'
+
+/**
+ * Fixed sampling temperature for all requests made through this
+ * provider.
+ */
+const REQUEST_TEMPERATURE = 0.2
+
+/**
+ * OpenRouterProvider
+ *
+ * Single responsibility: send chat messages to OpenRouter and return
+ * the assistant's reply as a plain string.
+ *
+ * This class:
+ *   - Reads OPENROUTER_API_KEY and OPENROUTER_MODEL from environment
+ *     variables at call time (never hardcoded).
+ *   - Falls back to "moonshotai/kimi-k2" when OPENROUTER_MODEL is
+ *     unset.
+ *   - Throws a descriptive Error, including HTTP status code, status
+ *     text, and any message OpenRouter returned, whenever the request
+ *     fails.
+ *   - Throws "OPENROUTER_API_KEY is missing." when no API key is
+ *     configured.
+ *   - Uses no `any` types.
+ */
+export class OpenRouterProvider {
+  /**
+   * Sends a list of chat messages to OpenRouter and returns the
+   * assistant's reply content.
+   *
+   * @param messages - The conversation to send, in chat message
+   *        order.
+   * @returns The assistant's reply message content.
+   * @throws Error if OPENROUTER_API_KEY is missing, if the HTTP
+   *         request fails, if OpenRouter returns a non-OK status, or
+   *         if the response contains no usable message content.
+   */
+  public async complete(messages: ChatMessage[]): Promise<string> {
+    const apiKey = process.env.OPENROUTER_API_KEY
+    const model = process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL
 
     if (!apiKey) {
-      throw new Error(
-        "OpenRouterProvider: OPENROUTER_API_KEY environment variable is not set."
-      );
+      throw new Error('OPENROUTER_API_KEY is missing.')
     }
 
-    const defaultModel = process.env.OPENROUTER_MODEL;
+    const response = await this.sendRequest(apiKey, model, messages)
+    return this.extractContent(response)
+  }
 
-    if (!defaultModel) {
-      throw new Error(
-        "OpenRouterProvider: OPENROUTER_MODEL environment variable is not set."
-      );
+  /**
+   * Performs the actual fetch() call to OpenRouter and returns the
+   * parsed successful response body. Throws a descriptive Error if
+   * the HTTP call fails outright or if OpenRouter responds with a
+   * non-OK status.
+   */
+  private async sendRequest(
+    apiKey: string,
+    model: string,
+    messages: ChatMessage[]
+  ): Promise<OpenRouterSuccessResponse> {
+    const body: OpenRouterRequestBody = {
+      model,
+      messages,
+      temperature: REQUEST_TEMPERATURE,
     }
 
-    this.timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    let response: Response
 
-    this.client = new OpenAI({
-      apiKey,
-      baseURL: BASE_URL,
-      timeout: this.timeoutMs,
-    });
-    this.defaultModel = defaultModel;
-    this.maxRetries = config?.maxRetries ?? 3;
-    this.retryDelayMs = config?.retryDelayMs ?? 500;
-  }
-
-  /**
-   * Sends a chat completion request to OpenRouter and returns a
-   * normalised response. Retries on transient failures.
-   */
-  public async generate(request: AIRequest): Promise<AIResponse> {
-    this.validateRequest(request);
-
-    const model = request.model ?? this.defaultModel;
-
-    return this.withRetries(async () => {
-      let completion: OpenAI.Chat.Completions.ChatCompletion;
-
-      try {
-        completion = await this.client.chat.completions.create({
-          model,
-          messages: this.toOpenAIMessages(request.messages),
-          max_tokens: request.maxTokens,
-          temperature: request.temperature,
-        });
-      } catch (error) {
-        throw this.toMeaningfulError(error, "generate");
-      }
-
-      const choice = completion.choices[0];
-
-      if (!choice || !choice.message || choice.message.content === null) {
-        throw new Error(
-          "OpenRouterProvider: received an empty completion from OpenRouter."
-        );
-      }
-
-      return {
-        content: choice.message.content,
-        model: completion.model,
-        provider: this.name,
-        usage: {
-          inputTokens: completion.usage?.prompt_tokens ?? 0,
-          outputTokens: completion.usage?.completion_tokens ?? 0,
-        },
-        raw: completion,
-      };
-    });
-  }
-
-  /**
-   * Streams a chat completion from OpenRouter, yielding text chunks
-   * as they arrive.
-   */
-  public stream(request: AIRequest): AsyncIterable<string> {
-    this.validateRequest(request);
-
-    const model = request.model ?? this.defaultModel;
-    const client = this.client;
-    const messages = this.toOpenAIMessages(request.messages);
-    const maxTokens = request.maxTokens;
-    const temperature = request.temperature;
-    const toMeaningfulError = this.toMeaningfulError.bind(this);
-
-    return {
-      [Symbol.asyncIterator]() {
-        let iterator: AsyncIterator<OpenAI.Chat.Completions.ChatCompletionChunk> | null =
-          null;
-
-        return {
-          async next(): Promise<IteratorResult<string>> {
-            try {
-              if (iterator === null) {
-                const stream = await client.chat.completions.create({
-                  model,
-                  messages,
-                  max_tokens: maxTokens,
-                  temperature,
-                  stream: true,
-                });
-
-                iterator = stream[Symbol.asyncIterator]();
-              }
-
-              const result = await iterator.next();
-
-              if (result.done) {
-                return { done: true, value: undefined };
-              }
-
-              const delta = result.value.choices[0]?.delta?.content ?? "";
-
-              return { done: false, value: delta };
-            } catch (error) {
-              throw toMeaningfulError(error, "stream");
-            }
-          },
-        };
-      },
-    };
-  }
-
-  /**
-   * Verifies connectivity and authentication with OpenRouter by
-   * listing available models. Returns false rather than throwing on
-   * failure.
-   */
-  public async healthCheck(): Promise<boolean> {
     try {
-      await this.client.models.list();
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Converts normalised AIMessages into the shape expected by the
-   * OpenAI SDK.
-   */
-  private toOpenAIMessages(
-    messages: readonly AIMessage[]
-  ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-    return messages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    }));
-  }
-
-  /**
-   * Validates the shape of an incoming request.
-   */
-  private validateRequest(request: AIRequest): void {
-    if (!request) {
-      throw new Error("OpenRouterProvider: request is required.");
+      response = await fetch(OPENROUTER_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'http://localhost:3000',
+          'X-Title': 'KDOS',
+        },
+        body: JSON.stringify(body),
+      })
+    } catch (networkError) {
+      const reason =
+        networkError instanceof Error ? networkError.message : String(networkError)
+      throw new Error(`OpenRouterProvider: network request failed: ${reason}`)
     }
 
-    if (!Array.isArray(request.messages) || request.messages.length === 0) {
+    if (!response.ok) {
+      const returnedMessage = await this.extractErrorMessage(response)
       throw new Error(
-        "OpenRouterProvider: request.messages must be a non-empty array."
-      );
+        `OpenRouterProvider: request failed with status ${response.status} (${response.statusText}): ${returnedMessage}`
+      )
+    }
+
+    return this.parseSuccessBody(response)
+  }
+
+  /**
+   * Parses a successful response body as JSON, guarding against a
+   * response that claims success but returns invalid or unparsable
+   * JSON.
+   */
+  private async parseSuccessBody(response: Response): Promise<OpenRouterSuccessResponse> {
+    try {
+      return (await response.json()) as OpenRouterSuccessResponse
+    } catch (parseError) {
+      const reason = parseError instanceof Error ? parseError.message : String(parseError)
+      throw new Error(
+        `OpenRouterProvider: failed to parse successful response body as JSON: ${reason}`
+      )
     }
   }
 
   /**
-   * Retries an operation on transient errors (rate limits, timeouts,
-   * server errors) using exponential backoff. Throws the last
-   * encountered error if all retries are exhausted.
+   * Attempts to extract a human-readable error message from a failed
+   * response body, falling back to raw text or a generic notice if
+   * the body cannot be parsed as JSON or is empty.
    */
-  private async withRetries<T>(operation: () => Promise<T>): Promise<T> {
-    let lastError: unknown;
+  private async extractErrorMessage(response: Response): Promise<string> {
+    let rawText: string
 
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        return await operation();
-      } catch (error) {
-        lastError = error;
-
-        if (!this.isRetryable(error) || attempt === this.maxRetries) {
-          throw error;
-        }
-
-        const delay = this.retryDelayMs * Math.pow(2, attempt);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
+    try {
+      rawText = await response.text()
+    } catch {
+      return 'no response body available'
     }
 
-    throw lastError;
+    if (!rawText) {
+      return 'no response body returned'
+    }
+
+    try {
+      const parsed = JSON.parse(rawText) as OpenRouterErrorResponse
+      return parsed.error?.message ?? rawText
+    } catch {
+      return rawText
+    }
   }
 
   /**
-   * Determines whether an error represents a transient failure that
-   * is safe to retry, including request timeouts.
+   * Extracts the assistant's message content from a successful
+   * OpenRouter response, throwing a descriptive Error if the
+   * response contains no usable choice or content.
    */
-  private isRetryable(error: unknown): boolean {
-    if (error instanceof OpenAI.APIConnectionTimeoutError) {
-      return true;
+  private extractContent(response: OpenRouterSuccessResponse): string {
+    const content = response.choices?.[0]?.message?.content
+
+    if (typeof content !== 'string' || content.length === 0) {
+      throw new Error(
+        'OpenRouterProvider: response succeeded but contained no assistant message content.'
+      )
     }
 
-    if (error instanceof OpenAI.APIError) {
-      const status = error.status;
-      return status === 429 || (status !== undefined && status >= 500);
-    }
-
-    return false;
-  }
-
-  /**
-   * Converts an SDK-level error into a meaningful, descriptive
-   * exception for consumers of the gateway.
-   */
-  private toMeaningfulError(error: unknown, operation: string): Error {
-    if (error instanceof OpenAI.APIConnectionTimeoutError) {
-      return new Error(
-        `OpenRouterProvider: ${operation} timed out after ${this.timeoutMs}ms.`
-      );
-    }
-
-    if (error instanceof OpenAI.APIError) {
-      return new Error(
-        `OpenRouterProvider: ${operation} failed with status ${error.status ?? "unknown"} - ${error.message}`
-      );
-    }
-
-    if (error instanceof Error) {
-      return new Error(
-        `OpenRouterProvider: ${operation} failed - ${error.message}`
-      );
-    }
-
-    return new Error(
-      `OpenRouterProvider: ${operation} failed with an unknown error.`
-    );
+    return content
   }
 }
