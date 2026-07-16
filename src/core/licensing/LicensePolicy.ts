@@ -1,45 +1,24 @@
 /**
- * License.ts
+ * LicensePolicy.ts
  *
- * Location: src/core/licensing/License.ts
+ * Location: src/core/licensing/LicensePolicy.ts
  *
- * License is the record that determines whether KDOS Business is
- * permitted to operate for a given company. This file defines the
- * License shape and its possible statuses only — no logic, no
- * storage, no network access.
+ * LicensePolicy describes what a License actually entitles a company
+ * to: which features, plugins, AI models, and AI workers are enabled,
+ * and what usage limits apply. This file defines the LicensePolicy
+ * shape only — no logic, no storage, no network access.
  */
 
 /**
- * The current status of a License.
+ * The entitlements and usage limits granted by a License.
  */
-export enum LicenseStatus {
-  ACTIVE = 'ACTIVE',
-  TRIAL = 'TRIAL',
-  EXPIRED = 'EXPIRED',
-  SUSPENDED = 'SUSPENDED',
-  CANCELLED = 'CANCELLED',
-}
-
-/**
- * The KDOS product edition a License grants.
- */
-export enum LicenseEdition {
-  STANDARD = 'STANDARD',
-  ENTERPRISE = 'ENTERPRISE',
-  WHITE_LABEL = 'WHITE_LABEL',
-}
-
-/**
- * A single license record. Governs whether, and under what edition,
- * a company is permitted to operate KDOS.
- */
-export interface License {
+export interface LicensePolicy {
   readonly licenseId: string
-  readonly companyId: string
-  readonly companyName: string
-  readonly edition: LicenseEdition
-  readonly status: LicenseStatus
-  readonly issuedAt: Date
-  readonly expiresAt: Date
-  readonly lastCheck: Date
+  readonly enabledFeatures: string[]
+  readonly enabledPlugins: string[]
+  readonly enabledAIModels: string[]
+  readonly enabledAIWorkers: string[]
+  readonly maximumStorage: number
+  readonly maximumProjects: number
+  readonly maximumClients: number
 }
